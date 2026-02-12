@@ -677,6 +677,22 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     open suspend fun getKey(accessToken: String, fileId: String): ByteArray =
         throw IllegalStateException()
 
+    private suspend fun getMercuryTokenWithHeaders(): StoredToken {
+        val request = Request.Builder()
+            .url("https://ap-gew4.spotify.com/token")
+            .header("Accept", "application/json")
+            .header("User-Agent", userAgent)
+            .build()
+        
+        return api.client.newCall(request).await().use { response ->
+            if (!response.isSuccessful) {
+                throw Exception("Mercury token failed: ${response.code}")
+            }
+            val body = response.body?.string() ?: throw Exception("Empty response")
+            api.json.decode<StoredToken>(body)
+        }
+    }
+
     private suspend fun oggStream(streamable: Streamable): Streamable.Media {
         val fileId = streamable.id
 
@@ -685,11 +701,28 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
             if (lastTime < time) delay(time - lastTime)
             val gid = streamable.extras["gid"]
                 ?: throw IllegalArgumentException("GID is required for streaming")
-            val storedToken = api.getMercuryToken()
+            
+            val storedToken = try {
+                getMercuryTokenWithHeaders()
+            } catch (e: Exception) {
+                // Force refresh on failure
+                lastFetched = 0
+                getMercuryTokenWithHeaders()
+            }
             lastFetched = System.currentTimeMillis()
             MercuryConnection.getAudioKey(storedToken, gid, fileId)
         }
-        val url = queries.storageResolve(streamable.id).json.cdnUrl.random()
+        
+        val resolve = try {
+            queries.storageResolve(streamable.id)
+        } catch (e: Exception) {
+            // Retry once with fresh token
+            lastFetched = 0
+            queries.storageResolve(streamable.id)
+        }
+        
+        val url = resolve.json.cdnUrl.random()
+        
         return Streamable.InputProvider { position, length ->
             decryptFromPosition(key, AUDIO_IV, position, length) { pos, len ->
                 val range = "bytes=$pos-${len?.toString() ?: ""}"
@@ -749,7 +782,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
             while (remaining > 0) {
                 val toRead = minOf(remaining, buffer.size)
                 val read = read(buffer, 0, toRead)
-                if (read == -1) break // EOF
+                if (read == -1) break
                 remaining -= read
             }
             if (remaining > 0) throw EOFException("Reached end of stream before reading $len bytes")
